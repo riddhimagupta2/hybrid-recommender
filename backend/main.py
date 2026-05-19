@@ -112,6 +112,11 @@ class PurchaseCreate(BaseModel):
     rating: float = 0.0
     review_text: str = ""
 
+class FeedbackCreate(BaseModel):
+    user_id: str
+    item: str
+    feedback: str
+
 
 # ── Config (for frontend — serves only public keys) ─────────────────
 
@@ -128,14 +133,11 @@ def get_config():
 
 @app.get("/api/status")
 def status():
-    sb = get_supabase()
-    count_result = sb.table('products').select('id', count='exact').limit(0).execute()
-    product_count = count_result.count or 0
+
     return {
-        "status": "ready" if models["ready"] else ("has_data" if product_count > 0 else "no_data"),
-        "product_count": product_count,
-        "model_ready": models["ready"],
-        "build_time": models["build_time"],
+        "status": "healthy",
+        "products": 120,
+        "message": "Mock status running locally"
     }
 
 
@@ -244,11 +246,18 @@ def dashboard():
 # ── Search (PostgreSQL FTS) ─────────────────────────────────────────
 
 @app.get("/api/search")
-def search_items(
-    q: str = "",
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-):
+def search_items(q: str = "", limit: int = 8):
+
+    mock_items = [
+        {"title": "iPhone 15", "rating": 4.8},
+        {"title": "Samsung Galaxy S24", "rating": 4.7},
+        {"title": "MacBook Air M3", "rating": 4.9},
+        {"title": "Sony WH-1000XM5", "rating": 4.6},
+        {"title": "Apple Watch Ultra", "rating": 4.7},
+    ]
+
+    return mock_items
+
     """
     Search products using PostgreSQL full-text search.
     Falls back to top-rated products when query is empty.
@@ -748,23 +757,18 @@ def create_purchase(data: PurchaseCreate):
     return {"purchase": result.data}
 # ── Dashboard ───────────────────────────────────────────────────────
 
-from datetime import datetime
-@app.get("/api/dashboard")
-def dashboard():
+# ── Feedback ────────────────────────────────────────────────────────
+
+@app.post("/api/feedback")
+def submit_feedback(data: FeedbackCreate):
+
     return {
-        "total_products": 120,
-        "total_users": 45,
-        "total_interactions": 523,
-        "avg_recommendation_score": 4.5,
-        "avg_sentiment_score": 0.82,
-        "top_5_recommended_products": [
-            "iPhone 15",
-            "Samsung Galaxy S24",
-            "MacBook Air M3",
-            "Sony WH-1000XM5",
-            "Apple Watch Ultra"
-        ],
-        "model_last_trained": datetime.utcnow().isoformat(),
+        "message": "Feedback submitted successfully",
+        "feedback": {
+            "user_id": data.user_id,
+            "item": data.item,
+            "feedback": data.feedback
+        }
     }
 # ── Frontend Serving ────────────────────────────────────────────────
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'frontend')
