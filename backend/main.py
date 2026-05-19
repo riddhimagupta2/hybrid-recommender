@@ -498,6 +498,17 @@ def create_purchase(data: PurchaseCreate):
     }).execute()
     return {"purchase": result.data}
 
+@main.route("/health")
+def health_check():
+    """
+    Returns server status. Useful for uptime monitors and Docker health checks.
+    """
+    import os
+    return jsonify({
+        "status": "ok",
+        "version": os.getenv("APP_VERSION", "1.0.0")
+    }), 200
+
 
 # ── Frontend Serving ────────────────────────────────────────────────
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'frontend')
