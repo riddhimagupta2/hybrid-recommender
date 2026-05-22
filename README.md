@@ -164,7 +164,7 @@ hybrid-recommender/
 
 ```bash
 # 1 — Clone & install
-git clone https://github.com/Bhumi1701/hybrid-recommender.git
+git clone https://github.com/leonagoel/hybrid-recommender.git 
 cd hybrid-recommender
 pip install -r requirements.txt
 ```
