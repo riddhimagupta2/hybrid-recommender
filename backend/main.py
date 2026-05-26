@@ -126,6 +126,62 @@ def _set_cache_headers(response: Response, status: str) -> None:
     response.headers["X-Cache"] = status
 
 
+def _get_rate_limit(limit_env: str, default_limit: int) -> int:
+    try:
+        limit = int(os.environ.get(limit_env, str(default_limit)))
+    except ValueError:
+        return default_limit
+    return max(1, limit)
+
+
+def _rate_limit_exceeded_response(rate_limit: int, reset_time: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "message": "Too many requests. Please try again later.",
+        },
+        headers={
+            "x-ratelimit-limit": str(rate_limit),
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": str(reset_time),
+        },
+    )
+
+
+def _apply_rate_limit(
+    request: Request,
+    response: Response,
+    scope: str,
+    limit_env: str,
+    default_limit: int,
+) -> JSONResponse | None:
+    rate_limit = _get_rate_limit(limit_env, default_limit)
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    bucket_key = (scope, client_ip)
+    now = time.time()
+
+    with _rate_limit_lock:
+        timestamps = _rate_limit_buckets.setdefault(bucket_key, [])
+        timestamps[:] = [timestamp for timestamp in timestamps if now - timestamp < 60]
+
+        reset_time = int(60 - (now - timestamps[0])) if timestamps else 60
+        reset_time = max(0, reset_time)
+
+        if len(timestamps) >= rate_limit:
+            return _rate_limit_exceeded_response(rate_limit, reset_time)
+
+        timestamps.append(now)
+        remaining = rate_limit - len(timestamps)
+        reset_time = int(60 - (now - timestamps[0])) if timestamps else 60
+        reset_time = max(0, reset_time)
+
+    response.headers["x-ratelimit-limit"] = str(rate_limit)
+    response.headers["x-ratelimit-remaining"] = str(remaining)
+    response.headers["x-ratelimit-reset"] = str(reset_time)
+    return None
+
+
 def _extract_bearer_token(value: str | None) -> str:
     if not value:
         return ""
@@ -436,38 +492,15 @@ def search_items(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    # ── Rate Limiting ──
-    try:
-        rate_limit = int(os.environ.get("RATE_LIMIT_SEARCH_PER_MIN", "60"))
-    except ValueError:
-        rate_limit = 60
-
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    now = time.time()
-
-    with _rate_limit_lock:
-        bucket = _rate_limit_buckets.setdefault(client_ip, {"timestamps": []})
-        bucket["timestamps"] = [t for t in bucket["timestamps"] if now - t < 60]
-
-        if len(bucket["timestamps"]) >= rate_limit:
-            reset_time = int(60 - (now - bucket["timestamps"][0])) if bucket["timestamps"] else 60
-            reset_time = max(0, reset_time)
-            response.status_code = 429
-            response.headers["x-ratelimit-limit"] = str(rate_limit)
-            response.headers["x-ratelimit-remaining"] = "0"
-            response.headers["x-ratelimit-reset"] = str(reset_time)
-            return {
-                "error": "Rate limit exceeded",
-                "message": "Too many requests. Please try again later.",
-            }
-
-        bucket["timestamps"].append(now)
-        remaining = rate_limit - len(bucket["timestamps"])
-        reset_time = int(60 - (now - bucket["timestamps"][0])) if bucket["timestamps"] else 60
-        reset_time = max(0, reset_time)
-        response.headers["x-ratelimit-limit"] = str(rate_limit)
-        response.headers["x-ratelimit-remaining"] = str(remaining)
-        response.headers["x-ratelimit-reset"] = str(reset_time)
+    rate_limited = _apply_rate_limit(
+        request,
+        response,
+        scope="search",
+        limit_env="RATE_LIMIT_SEARCH_PER_MIN",
+        default_limit=30,
+    )
+    if rate_limited is not None:
+        return rate_limited
 
     query = _normalize_search_query(q)
     cache_key = _cache_key("search", query, limit, offset)
@@ -681,38 +714,16 @@ def get_recommendations(
     top_n: int = 10,
     explain: bool = Query(False),
 ):
-    # ---- Rate limiting (60 requests per minute per IP) ----
-    try:
-        rate_limit = int(os.environ.get("RATE_LIMIT_RECOMMEND_PER_MIN", "60"))
-    except ValueError:
-        rate_limit = 60
+    rate_limited = _apply_rate_limit(
+        request,
+        response,
+        scope="recommend",
+        limit_env="RATE_LIMIT_RECOMMEND_PER_MIN",
+        default_limit=20,
+    )
+    if rate_limited is not None:
+        return rate_limited
 
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    now = time.time()
-
-    with _rate_limit_lock:
-        bucket = _rate_limit_buckets.setdefault(client_ip, {"timestamps": []})
-        bucket["timestamps"] = [t for t in bucket["timestamps"] if now - t < 60]
-
-        if len(bucket["timestamps"]) >= rate_limit:
-            reset_time = int(60 - (now - bucket["timestamps"][0])) if bucket["timestamps"] else 60
-            reset_time = max(0, reset_time)
-            response.headers["Retry-After"] = str(reset_time)
-            raise HTTPException(
-                status_code=429,
-                detail="Too Many Requests. Please try again later.",
-                headers={"Retry-After": str(reset_time)}
-            )
-
-        bucket["timestamps"].append(now)
-        remaining = rate_limit - len(bucket["timestamps"])
-        reset_time = int(60 - (now - bucket["timestamps"][0])) if bucket["timestamps"] else 60
-        reset_time = max(0, reset_time)
-        response.headers["x-ratelimit-limit"] = str(rate_limit)
-        response.headers["x-ratelimit-remaining"] = str(remaining)
-        response.headers["x-ratelimit-reset"] = str(reset_time)
-
-    # ---- Original logic ----
     if not models["ready"]:
         raise HTTPException(400, "Models not built. Build first via /api/build.")
     query_title = title or item_title
@@ -796,11 +807,23 @@ def _json_scalar(value):
 # ── Similar Items ─────────────────────────────────────────────────────
 @app.get("/api/similar/{item_id}")
 def get_similar_items(
+    request: Request,
+    response: Response,
     item_id: str,
     top_n: int = Query(10, ge=1, le=100),
     category: Optional[str] = Query(None),
     explain: bool = Query(False),
 ):
+    rate_limited = _apply_rate_limit(
+        request,
+        response,
+        scope="similar",
+        limit_env="RATE_LIMIT_SIMILAR_PER_MIN",
+        default_limit=20,
+    )
+    if rate_limited is not None:
+        return rate_limited
+
     if not models["ready"] or models["item_df"] is None:
         raise HTTPException(400, "Models not built. Build first via /api/build.")
     item_df = models["item_df"]
