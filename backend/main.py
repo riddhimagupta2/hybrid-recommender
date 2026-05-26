@@ -411,6 +411,7 @@ class RealtimeRecommendationRequest(BaseModel):
     item_title: str
     top_n: int = 10
     explain: bool = False
+    target_catalog: Optional[str] = None
 
 
 # ── CSRF Token ───────────────────────────────────────────────────────
@@ -850,6 +851,7 @@ def get_recommendations(
     title: Optional[str] = Query(None),
     top_n: int = 10,
     explain: bool = Query(False),
+    target_catalog: Optional[str] = Query(None),
 ):
     rate_limited = _apply_rate_limit(
         request,
@@ -867,13 +869,15 @@ def get_recommendations(
     if not query_title:
         raise HTTPException(422, "Query parameter 'title' is required.")
 
-    cache_key = _cache_key("recommend", query_title, top_n, explain)
+    cache_key = _cache_key("recommend", query_title, top_n, explain, target_catalog)
     cached = _get_cached_response(cache_key)
     if cached is not None:
         _set_cache_headers(response, "HIT")
         return cached
 
-    recs = models["hybrid"].recommend(query_title, top_n=top_n, explain=explain)
+    recs = models["hybrid"].recommend(
+        query_title, top_n=top_n, explain=explain, target_catalog=target_catalog
+    )
     if not recs:
         raise HTTPException(404, "Item not found or no recommendations.")
 
@@ -882,6 +886,7 @@ def get_recommendations(
         "recommendations": recs,
         "weights": models["hybrid"].get_weights(),
         "explain": explain,
+        "target_catalog": target_catalog,
     }
     _set_cached_response(cache_key, payload)
     _set_cache_headers(response, "MISS")
