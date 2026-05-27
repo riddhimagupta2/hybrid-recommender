@@ -404,6 +404,17 @@ models = {
     "last_trained_at": None,
 }
 
+MODEL_REGISTRY = {}
+ACTIVE_MODEL_VERSION = None
+SHADOW_MODEL_VERSION = None
+STAGING_MODEL_VERSION = None
+
+SHADOW_LOGS = []
+
+def generate_model_version():
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"1.0.0-{timestamp}"
+
 
 class RealtimeConnectionHub:
     def __init__(self):
@@ -866,7 +877,11 @@ async def upload_dataset(
 # ── Build Models ──────────────────────────────────────────────────────
 @app.post("/api/build")
 def build_models(_csrf: None = Depends(csrf_header_dep)):
-    sb = get_supabase()
+    global STAGING_MODEL_VERSION
+    try:
+       sb = get_supabase_admin()
+    except RuntimeError:
+        sb = get_supabase()
     all_products = []
     page_size = 1000
     offset = 0
@@ -908,6 +923,30 @@ def build_models(_csrf: None = Depends(csrf_header_dep)):
         logger.warning("Collaborative model data load failed: %s", e)
     hybrid_model = HybridRecommender(content_model, collab_model, item_df)
     build_time = round(time.time() - start_time, 2)
+    
+    version = generate_model_version()
+
+    MODEL_REGISTRY[version] = {
+        "content": content_model,
+        "collab": collab_model,
+        "hybrid": hybrid_model,
+        "item_df": item_df,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "training_metadata": {
+            "items": len(item_df),
+            "has_collaborative": collab_model is not None,
+            "build_time_seconds": build_time,
+        },
+        "status": "staging",
+        "metrics": {
+            "ndcg": 0.0,
+            "latency_ms": 0.0,
+            "error_rate": 0.0,
+        },
+    }
+
+    STAGING_MODEL_VERSION = version
+    
     models["content"] = content_model
     models["collab"] = collab_model
     models["hybrid"] = hybrid_model
@@ -918,11 +957,12 @@ def build_models(_csrf: None = Depends(csrf_header_dep)):
     _clear_response_cache()
     return {
         "message": "Models built successfully!",
+        "model_version": version,
+        "status": "staging",
         "items": len(item_df),
         "has_collaborative": collab_model is not None,
         "build_time_seconds": build_time,
     }
-
 
 @app.post("/api/train/federated")
 def train_federated(req: FederatedTrainRequest):
@@ -1019,6 +1059,7 @@ def get_recommendations(
     top_n: int = 10,
     explain: bool = Query(False),
     target_catalog: Optional[str] = Query(None),
+    model_version: Optional[str] = Query(None),
 ):
     rate_limited = _apply_rate_limit(
         request,
@@ -1035,6 +1076,19 @@ def get_recommendations(
     query_title = title or item_title
     if not query_title:
         raise HTTPException(422, "Query parameter 'title' is required.")
+    selected_models = models
+
+    if model_version == "staging":
+        if not STAGING_MODEL_VERSION:
+            raise HTTPException(404, "No staging model available.")
+
+        selected_models = MODEL_REGISTRY[STAGING_MODEL_VERSION]
+
+    elif model_version:
+        if model_version not in MODEL_REGISTRY:
+            raise HTTPException(404, "Requested model version not found.")
+
+        selected_models = MODEL_REGISTRY[model_version]
 
     cache_key = _cache_key("recommend", query_title, top_n, explain, target_catalog)
     cached = _get_cached_response(cache_key)
@@ -1042,7 +1096,7 @@ def get_recommendations(
         _set_cache_headers(response, "HIT")
         return cached
 
-    recs = models["hybrid"].recommend(
+    recs = selected_models["hybrid"].recommend(
         query_title, top_n=top_n, explain=explain, target_catalog=target_catalog
     )
     if not recs:
@@ -1057,7 +1111,56 @@ def get_recommendations(
         "weights": models["hybrid"].get_weights(),
         "explain": explain,
         "target_catalog": target_catalog,
+        "model_version": model_version or ACTIVE_MODEL_VERSION,
     }
+
+    if (
+        SHADOW_MODEL_VERSION
+        and SHADOW_MODEL_VERSION in MODEL_REGISTRY
+        and model_version is None
+    ):
+        shadow_model = MODEL_REGISTRY[SHADOW_MODEL_VERSION]
+
+        shadow_start = time.time()
+
+        try:
+            shadow_recs = shadow_model["hybrid"].recommend(
+                query_title,
+                top_n=top_n,
+                explain=explain,
+                target_catalog=target_catalog,
+            )
+
+            shadow_latency = round(
+                (time.time() - shadow_start) * 1000,
+                2,
+            )
+
+            shadow_model["metrics"]["latency_ms"] = shadow_latency
+            shadow_model["metrics"]["error_rate"] = 0.0
+
+            SHADOW_LOGS.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "production_version": ACTIVE_MODEL_VERSION,
+                "shadow_version": SHADOW_MODEL_VERSION,
+                "query": query_title,
+                "shadow_count": len(shadow_recs),
+                "latency_ms": shadow_latency,
+                "error": None,
+            })
+
+        except Exception as e:
+            shadow_model["metrics"]["error_rate"] = 1.0
+
+            SHADOW_LOGS.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "production_version": ACTIVE_MODEL_VERSION,
+                "shadow_version": SHADOW_MODEL_VERSION,
+                "query": query_title,
+                "shadow_count": 0,
+                "latency_ms": 0.0,
+                "error": str(e),
+            })
     _set_cached_response(cache_key, payload)
     _set_cache_headers(response, "MISS")
     return payload
@@ -1220,8 +1323,83 @@ def similarity_matrix(items: str = Query(...)):
         result["not_found"] = not_found
     return result
 
-
 # ── Weights ───────────────────────────────────────────────────────────
+@app.get("/api/models")
+def list_models():
+    return {
+        "active_model": ACTIVE_MODEL_VERSION,
+        "shadow_model": SHADOW_MODEL_VERSION,
+        "staging_model": STAGING_MODEL_VERSION,
+        "models": [
+            {
+                "version": version,
+                "status": data.get("status"),
+                "created_at": data.get("created_at"),
+                "training_metadata": data.get("training_metadata"),
+                "metrics": data.get("metrics"),
+            }
+            for version, data in MODEL_REGISTRY.items()
+        ],
+    }
+@app.post("/api/models/{version}/promote")
+def promote_model(version: str, _csrf: None = Depends(csrf_header_dep)):
+    global ACTIVE_MODEL_VERSION, SHADOW_MODEL_VERSION, STAGING_MODEL_VERSION
+
+    if version not in MODEL_REGISTRY:
+        raise HTTPException(404, "Model version not found.")
+
+    start_time = time.time()
+
+    for model_version, data in MODEL_REGISTRY.items():
+        if data.get("status") == "production":
+            data["status"] = "archived"
+
+    selected = MODEL_REGISTRY[version]
+    selected["status"] = "production"
+    selected["promoted_at"] = datetime.now(timezone.utc).isoformat()
+
+    ACTIVE_MODEL_VERSION = version
+    SHADOW_MODEL_VERSION = None
+    if STAGING_MODEL_VERSION == version:
+        STAGING_MODEL_VERSION = None
+
+    models["content"] = selected["content"]
+    models["collab"] = selected["collab"]
+    models["hybrid"] = selected["hybrid"]
+    models["item_df"] = selected["item_df"]
+    models["ready"] = True
+    models["build_time"] = selected["training_metadata"]["build_time_seconds"]
+    models["last_trained_at"] = selected["created_at"]
+
+    _clear_response_cache()
+
+    return {
+        "message": "Model promoted successfully.",
+        "version": version,
+        "status": "production",
+        "rollback_time_seconds": round(time.time() - start_time, 4),
+    }
+
+@app.post("/api/models/{version}/shadow")
+def move_model_to_shadow(version: str, _csrf: None = Depends(csrf_header_dep)):
+    global SHADOW_MODEL_VERSION, STAGING_MODEL_VERSION
+
+    if version not in MODEL_REGISTRY:
+        raise HTTPException(404, "Model version not found.")
+
+    MODEL_REGISTRY[version]["status"] = "shadow"
+    MODEL_REGISTRY[version]["shadow_started_at"] = datetime.now(timezone.utc).isoformat()
+
+    SHADOW_MODEL_VERSION = version
+    if STAGING_MODEL_VERSION == version:
+        STAGING_MODEL_VERSION = None
+
+    return {
+        "message": "Model moved to shadow mode.",
+        "version": version,
+        "status": "shadow",
+    }
+
 @app.get("/api/weights")
 def get_weights():
     if not models["ready"]:
